@@ -1,4 +1,4 @@
-"""SQLAlchemy models — поля извлечены из calculator_MP/models/marketplace_order.py."""
+"""SQLAlchemy models — поля извлечены из внутренней модели заказа."""
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, Integer, Float, String, Text, DateTime, Date, create_engine, event
@@ -62,7 +62,7 @@ class Order(Base):
     delivery_type = Column(String(20), default="delivery")
     has_assembly = Column(String(10), default="yes")
 
-    # ── финансы (из calculator_MP:246-273) ──
+    # ── финансы (из внутренней модели финансов) ──
     price_bed = Column(Float, default=0.0)
     price_mattress = Column(Float, default=0.0)
     price_floor_frame = Column(Float, default=0.0)
@@ -251,7 +251,7 @@ class EtlState(Base):
     """
     __tablename__ = "etl_state"
 
-    key = Column(String(100), primary_key=True)  # e.g. "analytics:ozon_rs"
+    key = Column(String(100), primary_key=True)  # e.g. "analytics:shop_b"
     last_sync = Column(Date)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -265,7 +265,7 @@ class Experiment(Base):
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=True)
     description = Column(Text)
-    shop = Column(String(50), index=True, comment="Кабинеты через запятую (ozon_stylint,ozon_rs)")
+    shop = Column(String(50), index=True, comment="Кабинеты через запятую (shop_a,shop_b)")
     offer_ids = Column(Text, comment="Артикулы кровати через запятую")
     result = Column(Text, comment="Результат эксперимента")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

@@ -427,7 +427,7 @@ def sync_finance(session, shops: list[str] = None, days_back: int = 30):
         session.commit()
 
 
-def sync_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
+def sync_ads(session, shop: str = "shop_a", days_back: int = 30):
     """Синхронизация рекламной статистики из Performance API."""
     from .performance_client import PerformanceClient
 
@@ -547,7 +547,7 @@ def sync_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
     session.commit()
 
 
-def sync_cpo_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
+def sync_cpo_ads(session, shop: str = "shop_a", days_back: int = 30):
     """Синхронизация расхода «Оплата за заказ» (CPO/SEARCH_PROMO) из Performance API.
 
     Стандартный /api/client/statistics отклоняет кампании «Оплата за заказ», поэтому

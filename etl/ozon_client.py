@@ -1,5 +1,5 @@
 """
-Ozon Seller API client — адаптирован из calculator_MP/utils/ozon_api.py.
+Ozon Seller API client — адаптирован из внутреннего модуля API-клиента.
 Добавлены эндпоинты аналитики, финансов, остатков.
 """
 import os
@@ -18,15 +18,15 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api-seller.ozon.ru"
 
 SHOPS_CONFIG = {
-    "ozon_stylint": {
-        "client_id_env": "OZON_STYLINT_CLIENT_ID",
-        "client_id_default": "443362",
-        "api_key_env": "OZON_STYLINT_API_KEY",
+    "shop_a": {
+        "client_id_env": "OZON_SHOP_A_CLIENT_ID",
+        "client_id_default": "",
+        "api_key_env": "OZON_SHOP_A_API_KEY",
     },
-    "ozon_rs": {
-        "client_id_env": "OZON_RS_CLIENT_ID",
-        "client_id_default": "3201725",
-        "api_key_env": "OZON_RS_API_KEY",
+    "shop_b": {
+        "client_id_env": "OZON_SHOP_B_CLIENT_ID",
+        "client_id_default": "",
+        "api_key_env": "OZON_SHOP_B_API_KEY",
     },
 }
 
@@ -128,13 +128,13 @@ class OzonClient:
             return resp
         return resp
 
-    # ── adapted from calculator_MP/utils/ozon_api.py ──────────────────────
+    # ── adapted from внутреннего модуля API-клиента ──────────────────────
 
     def fetch_fbs_postings(
         self, days_back: int = 30, skip_details_for: set = None
     ) -> list[dict]:
         """
-        Список FBS-отправлений. Взято из calculator_MP/utils/ozon_api.py:20-193.
+        Список FBS-отправлений. Взято из внутреннего модуля API-клиента:20-193.
         Расширено: финансовые данные парсятся, а не кладутся сырым JSON.
         """
         if skip_details_for is None:

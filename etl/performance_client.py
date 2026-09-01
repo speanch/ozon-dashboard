@@ -39,13 +39,13 @@ def _request_with_retry(method: str, url: str, retries: int = 5, backoff: float 
 
 
 class PerformanceClient:
-    def __init__(self, shop: str = "ozon_stylint"):
-        if shop == "ozon_rs":
-            self._client_id = os.getenv("PERFORMANCE_RS_CLIENT_ID")
-            self._client_secret = os.getenv("PERFORMANCE_RS_CLIENT_SECRET")
+    def __init__(self, shop: str = "shop_a"):
+        if shop == "shop_b":
+            self._client_id = os.getenv("PERFORMANCE_SHOP_B_CLIENT_ID")
+            self._client_secret = os.getenv("PERFORMANCE_SHOP_B_CLIENT_SECRET")
         else:
-            self._client_id = os.getenv("PERFORMANCE_STYLINT_CLIENT_ID")
-            self._client_secret = os.getenv("PERFORMANCE_STYLINT_CLIENT_SECRET")
+            self._client_id = os.getenv("PERFORMANCE_SHOP_A_CLIENT_ID")
+            self._client_secret = os.getenv("PERFORMANCE_SHOP_A_CLIENT_SECRET")
         self._token = None
         self._token_expires = 0
 

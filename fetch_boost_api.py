@@ -16,8 +16,8 @@
 С флагом --diff сравнивает с предыдущим снапшотом и показывает изменения по товарам.
 
 Использование:
-    python fetch_boost_api.py --shop stylint
-    python fetch_boost_api.py --shop stylint --diff
+    python fetch_boost_api.py --shop shop_a
+    python fetch_boost_api.py --shop shop_a --diff
     python fetch_boost_api.py --shop all
 """
 import argparse
@@ -35,8 +35,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(HERE, ".env"))
 
 SHOPS = {
-    "stylint": (os.getenv("OZON_STYLINT_CLIENT_ID", "443362"), os.getenv("OZON_STYLINT_API_KEY", "")),
-    "rs": (os.getenv("OZON_RS_CLIENT_ID", "3201725"), os.getenv("OZON_RS_API_KEY", "")),
+    "shop_a": (os.getenv("OZON_SHOP_A_CLIENT_ID", ""), os.getenv("OZON_SHOP_A_API_KEY", "")),
+    "shop_b": (os.getenv("OZON_SHOP_B_CLIENT_ID", ""), os.getenv("OZON_SHOP_B_API_KEY", "")),
 }
 
 
@@ -167,7 +167,7 @@ def diff(prev, curr):
 
 def main():
     ap = argparse.ArgumentParser(description="Эластичный бустинг Ozon по API")
-    ap.add_argument("--shop", default="stylint", choices=list(SHOPS) + ["all"])
+    ap.add_argument("--shop", default="shop_a", choices=list(SHOPS) + ["all"])
     ap.add_argument("--diff", action="store_true", help="сравнить с предыдущим снапшотом")
     ap.add_argument("--out", default=os.path.join(HERE, "snapshots"))
     args = ap.parse_args()

@@ -1,12 +1,14 @@
+"""Конфигурация дашборда: кабинеты, лейблы, экономические коэффициенты."""
+import os
 from dataclasses import dataclass
 
 DB_PATH = "dashboard.db"
 
-SHOPS = ["ozon_stylint", "ozon_rs"]
+SHOPS = ["shop_a", "shop_b"]
 
 
 def order_shops(shops):
-    """Сортирует ключи кабинетов в каноническом порядке SHOPS (Stylint первым, затем Room Saver)."""
+    """Сортирует ключи кабинетов в каноническом порядке SHOPS."""
     order = {s: i for i, s in enumerate(SHOPS)}
     return sorted(shops, key=lambda s: (order.get(s, len(order)), s))
 
@@ -19,24 +21,24 @@ class Shop:
     has_performance: bool = False
 
 SHOP_DEFS = {
-    "ozon_stylint": Shop(
-        key="ozon_stylint",
-        label="Stylint",
-        client_id_default="443362",
+    "shop_a": Shop(
+        key="shop_a",
+        label="Кабинет A",
+        client_id_default="",
         has_premium=True,
         has_performance=True,
     ),
-    "ozon_rs": Shop(
-        key="ozon_rs",
-        label="Room Saver",
-        client_id_default="3201725",
+    "shop_b": Shop(
+        key="shop_b",
+        label="Кабинет B",
+        client_id_default="",
         has_premium=True,
         has_performance=True,
     ),
 }
 
 SHOP_LABELS = {s.key: s.label for s in SHOP_DEFS.values()}
-SHOP_COLORS = {"ozon_stylint": "#2962FF", "ozon_rs": "#00C853"}
+SHOP_COLORS = {"shop_a": "#2962FF", "shop_b": "#00C853"}
 
 STATUS_LABELS = {
     "awaiting_packaging": "Ожидает сборки",
@@ -50,11 +52,13 @@ STATUS_LABELS = {
 OZON_API_BASE = "https://api-seller.ozon.ru"
 
 # ── коэффициенты полной себестоимости (для расчёта «прибыли по принятым») ──
-# К себестоимости товара добавляются доли на прочие расходы:
-COMMISSION_RATE = 0.55   # комиссия Озона
-DRR_RATE = 0.15          # заложенные расходы на ДРР (рекламу)
-TAX_RATE = 0.07          # налог
-ACQUIRING_RATE = 0.025   # эквайринг
+# К себестоимости товара добавляются доли на прочие расходы: комиссия площадки,
+# заложенный ДРР (реклама), налог, эквайринг. Значения настраиваются в .env
+# под конкретный бизнес.
+COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", "0.20"))   # комиссия площадки
+DRR_RATE = float(os.getenv("DRR_RATE", "0.15"))                 # заложенные расходы на ДРР
+TAX_RATE = float(os.getenv("TAX_RATE", "0.07"))                 # налог
+ACQUIRING_RATE = float(os.getenv("ACQUIRING_RATE", "0.025"))    # эквайринг
 FULL_COST_MULTIPLIER = 1.0 + COMMISSION_RATE + DRR_RATE + TAX_RATE + ACQUIRING_RATE
 
 _PREMIUM_SHOPS = {s.key for s in SHOP_DEFS.values() if s.has_premium}

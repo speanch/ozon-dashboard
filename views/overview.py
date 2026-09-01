@@ -170,7 +170,7 @@ k1.metric("Заказов", total_orders, help="Количество заказ�
 k2.metric("Выручка", f"{total_revenue:,.0f} ₽", help="Сумма продаж (цена × количество).")
 k3.metric("Прибыль", f"{total_profit:,.0f} ₽", help="Прибыль = выручка − полная себестоимость (себестоимость × 1.795: +55% комиссия, +15% ДРР, +7% налог, +2.5% эквайринг).")
 
-SHOP_CARD_BG = {"ozon_stylint": "#f2f4f7", "ozon_rs": "#e1e5ec"}
+SHOP_CARD_BG = {"shop_a": "#f2f4f7", "shop_b": "#e1e5ec"}
 
 def _shop_card(shop: str, fields: list[tuple[str, str]]) -> None:
     label = SHOP_LABELS.get(shop, shop)
@@ -248,9 +248,13 @@ st.divider()
 def _fetch_ratings() -> dict[str, float]:
     """Возвращает {shop_key: rating_value} для каждого магазина."""
     from dotenv import load_dotenv; load_dotenv()
-    from etl.ozon_client import OzonClient
+    from etl.ozon_client import OzonClient, SHOPS_CONFIG
     ratings = {}
-    for shop in ["ozon_stylint", "ozon_rs"]:
+    for shop in ["shop_a", "shop_b"]:
+        cfg = SHOPS_CONFIG.get(shop, {})
+        if not os.getenv(cfg.get("api_key_env", "")):
+            ratings[shop] = None
+            continue
         try:
             client = OzonClient(shop)
             r = client.get_seller_ratings()
@@ -266,7 +270,7 @@ def _active_campaigns() -> set[str]:
     from dotenv import load_dotenv; load_dotenv()
     from etl.performance_client import PerformanceClient
     ids = set()
-    for shop in ["ozon_stylint", "ozon_rs"]:
+    for shop in ["shop_a", "shop_b"]:
         try:
             pc = PerformanceClient(shop)
             ids |= pc.get_active_campaign_ids()
@@ -277,7 +281,7 @@ def _active_campaigns() -> set[str]:
 st.subheader("Рейтинг и баланс")
 st.caption("Рейтинг и баланс — текущие показатели, не зависящие от выбранного периода.")
 
-for shop in ["ozon_stylint", "ozon_rs"]:
+for shop in ["shop_a", "shop_b"]:
     if shop not in selected_mp:
         continue
     rating = seller_ratings.get(shop)
