@@ -4,6 +4,12 @@ DB_PATH = "dashboard.db"
 
 SHOPS = ["ozon_stylint", "ozon_rs"]
 
+
+def order_shops(shops):
+    """Сортирует ключи кабинетов в каноническом порядке SHOPS (Stylint первым, затем Room Saver)."""
+    order = {s: i for i, s in enumerate(SHOPS)}
+    return sorted(shops, key=lambda s: (order.get(s, len(order)), s))
+
 @dataclass(frozen=True)
 class Shop:
     key: str
@@ -42,6 +48,14 @@ STATUS_LABELS = {
 }
 
 OZON_API_BASE = "https://api-seller.ozon.ru"
+
+# ── коэффициенты полной себестоимости (для расчёта «прибыли по принятым») ──
+# К себестоимости товара добавляются доли на прочие расходы:
+COMMISSION_RATE = 0.55   # комиссия Озона
+DRR_RATE = 0.15          # заложенные расходы на ДРР (рекламу)
+TAX_RATE = 0.07          # налог
+ACQUIRING_RATE = 0.025   # эквайринг
+FULL_COST_MULTIPLIER = 1.0 + COMMISSION_RATE + DRR_RATE + TAX_RATE + ACQUIRING_RATE
 
 _PREMIUM_SHOPS = {s.key for s in SHOP_DEFS.values() if s.has_premium}
 _PERFORMANCE_SHOPS = {s.key for s in SHOP_DEFS.values() if s.has_performance}

@@ -1,7 +1,7 @@
 """SQLAlchemy models — поля извлечены из calculator_MP/models/marketplace_order.py."""
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, Float, String, Text, DateTime, Date, create_engine
+from sqlalchemy import Column, Integer, Float, String, Text, DateTime, Date, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session
 
 
@@ -223,6 +223,7 @@ class ProductPrice(Base):
     min_price = Column(Float, default=0.0)
     marketing_price = Column(Float, default=0.0)
     retail_price = Column(Float, default=0.0)
+    net_price = Column(Float, default=0.0, comment="Себестоимость товара")
     price_index = Column(Float, default=0.0)
     color_index = Column(String(30))
     commission_fbo = Column(Float, default=0.0)
@@ -240,6 +241,34 @@ class ProductMapping(Base):
     offer_id = Column(String(100), index=True)
     product_id = Column(String(50))
     name = Column(String(500))
+
+
+class EtlState(Base):
+    """Ключ-значение: последняя успешная синхронизация по сущности и кабинету.
+
+    Используется для инкрементальной догрузки (аналитика, финансы), чтобы
+    не перекачивать полное окно на каждом запуске.
+    """
+    __tablename__ = "etl_state"
+
+    key = Column(String(100), primary_key=True)  # e.g. "analytics:ozon_rs"
+    last_sync = Column(Date)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class Experiment(Base):
+    """Временная метка эксперимента для графиков динамики (начало–конец + название)."""
+    __tablename__ = "experiments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)
+    description = Column(Text)
+    shop = Column(String(50), index=True, comment="Кабинеты через запятую (ozon_stylint,ozon_rs)")
+    offer_ids = Column(Text, comment="Артикулы кровати через запятую")
+    result = Column(Text, comment="Результат эксперимента")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class BoostSnapshot(Base):
@@ -266,9 +295,80 @@ class BoostSnapshot(Base):
 
 
 def init_db(path: str = "dashboard.db"):
-    engine = create_engine(f"sqlite:///{path}")
+    engine = create_engine(f"sqlite:///{path}", connect_args={"timeout": 30})
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+
     Base.metadata.create_all(engine)
+    _migrate(engine)
     return engine
+
+
+def _migrate(engine):
+    """Добавляет недостающие колонки в существующие таблицы (без потери данных)."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    with engine.begin() as conn:
+        if "experiments" in tables:
+            cols = {c["name"] for c in inspector.get_columns("experiments")}
+            if "shop" not in cols:
+                conn.execute(text("ALTER TABLE experiments ADD COLUMN shop VARCHAR(50)"))
+            if "offer_ids" not in cols:
+                conn.execute(text("ALTER TABLE experiments ADD COLUMN offer_ids TEXT"))
+            if "result" not in cols:
+                conn.execute(text("ALTER TABLE experiments ADD COLUMN result TEXT"))
+
+            info = conn.execute(text("PRAGMA table_info(experiments)")).fetchall()
+            end_row = next((r for r in info if r[1] == "end_date"), None)
+            if end_row is not None and end_row[3]:
+                conn.execute(text(
+                    "CREATE TABLE experiments_new ("
+                    "id INTEGER NOT NULL, "
+                    "name VARCHAR(200) NOT NULL, "
+                    "start_date DATE NOT NULL, "
+                    "end_date DATE, "
+                    "description TEXT, "
+                    "created_at DATETIME, "
+                    "shop VARCHAR(50), "
+                    "offer_ids TEXT, "
+                    "result TEXT, "
+                    "PRIMARY KEY (id))"
+                ))
+                conn.execute(text(
+                    "INSERT INTO experiments_new "
+                    "(id, name, start_date, end_date, description, created_at, shop, offer_ids, result) "
+                    "SELECT id, name, start_date, end_date, description, created_at, shop, offer_ids, result "
+                    "FROM experiments"
+                ))
+                conn.execute(text("DROP TABLE experiments"))
+                conn.execute(text("ALTER TABLE experiments_new RENAME TO experiments"))
+
+        if "product_prices" in tables:
+            pcols = {c["name"] for c in inspector.get_columns("product_prices")}
+            if "net_price" not in pcols:
+                conn.execute(text("ALTER TABLE product_prices ADD COLUMN net_price FLOAT DEFAULT 0.0"))
+
+        # Убираем дубликаты, накопившиеся до появления инкрементальной догрузки
+        # с дедупликацией (одинаковые строки за один (shop, date, sku)).
+        if "daily_metrics" in tables:
+            conn.execute(text(
+                "DELETE FROM daily_metrics WHERE id NOT IN "
+                "(SELECT MIN(id) FROM daily_metrics GROUP BY shop, date, sku)"
+            ))
+
+        if "finance_transactions" in tables:
+            conn.execute(text(
+                "DELETE FROM finance_transactions WHERE id NOT IN "
+                "(SELECT MIN(id) FROM finance_transactions "
+                "GROUP BY shop, operation_date, operation_type, operation_type_name, posting_number, amount)"
+            ))
 
 
 def get_session(engine) -> Session:

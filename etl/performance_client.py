@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -75,16 +75,21 @@ class PerformanceClient:
             h.update(extra)
         return h
 
+    ADV_OBJECT_TYPES = ("SKU", "SEARCH_PROMO")
+
     def get_campaigns(self) -> list[dict]:
-        resp = _request_with_retry(
-            "GET",
-            f"{PERF_BASE}/api/client/campaign",
-            params={"advObjectType": "SKU"},
-            headers=self._headers({"Accept": "application/json"}),
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json().get("list", [])
+        campaigns: list[dict] = []
+        for adv_type in self.ADV_OBJECT_TYPES:
+            resp = _request_with_retry(
+                "GET",
+                f"{PERF_BASE}/api/client/campaign",
+                params={"advObjectType": adv_type},
+                headers=self._headers({"Accept": "application/json"}),
+                timeout=30,
+            )
+            resp.raise_for_status()
+            campaigns.extend(resp.json().get("list", []))
+        return campaigns
 
     def get_active_campaign_names(self) -> set[str]:
         """Возвращает названия активных (запущенных) кампаний."""
@@ -115,20 +120,23 @@ class PerformanceClient:
         )
         return resp.json()["UUID"]
 
-    def _poll_report(self, uuid: str, timeout: int = 120) -> dict | None:
+    def _poll_report_once(self, uuid: str, timeout: int = 10) -> dict:
         headers = self._headers({"Accept": "application/json"})
+        resp = _request_with_retry(
+            "GET",
+            f"{PERF_BASE}/api/client/statistics/{uuid}",
+            headers=headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _poll_report(self, uuid: str, timeout: int = 120) -> dict | None:
         waited = 0
         while waited < timeout:
             time.sleep(4)
             waited += 4
-            resp = _request_with_retry(
-                "GET",
-                f"{PERF_BASE}/api/client/statistics/{uuid}",
-                headers=headers,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = self._poll_report_once(uuid)
             state = data.get("state")
             if state == "OK":
                 return data
@@ -138,6 +146,38 @@ class PerformanceClient:
             # NOT_STARTED, PROCESSING — continue polling
         logger.warning("Stats timeout after %ds", timeout)
         return None
+
+    def _poll_reports(self, jobs: list, max_wait: int = 120) -> list:
+        """Опрашивает сразу все отчёты параллельно.
+
+        jobs: список (uuid, campaigns_by_id).
+        Возвращает список готовых (report_dict, campaigns_by_id).
+        """
+        pending = list(jobs)
+        results = []
+        waited = 0
+        while pending and waited < max_wait:
+            time.sleep(4)
+            waited += 4
+            still = []
+            for uuid, cbid in pending:
+                try:
+                    data = self._poll_report_once(uuid)
+                except Exception as e:
+                    logger.warning("Poll %s failed: %s", uuid[:8], e)
+                    still.append((uuid, cbid))
+                    continue
+                state = data.get("state")
+                if state == "OK":
+                    results.append((data, cbid))
+                elif state in ("ERROR", "CANCELED"):
+                    logger.warning("Stats %s state: %s", uuid[:8], state)
+                else:
+                    still.append((uuid, cbid))
+            pending = still
+        if pending:
+            logger.warning("Stats timeout: %d reports still pending", len(pending))
+        return results
 
     def _download_csv(self, link: str, campaigns_by_id: dict = None) -> list[dict]:
         resp = _request_with_retry(
@@ -179,6 +219,14 @@ class PerformanceClient:
                 continue
             try:
                 date_str = parts[0].strip().replace("\xa0", "").replace("\u00a0", "")
+                # Пропускаем итоговую строку «Всего» и любые строки без валидной даты,
+                # иначе они попадают в «сегодня» через fallback при парсинге даты.
+                if not date_str or date_str.lower().startswith("всего"):
+                    continue
+                try:
+                    date.fromisoformat(date_str)
+                except ValueError:
+                    datetime.strptime(date_str, "%d.%m.%Y")
                 rows.append({
                     "campaign_id": campaign_id,
                     "campaign_name": campaign_name,
@@ -213,19 +261,28 @@ class PerformanceClient:
         if not campaigns:
             return []
 
-        # Filter out archived, finished, draft, or unknown inactive campaigns to reduce batch counts
-        active_states = {"CAMPAIGN_STATE_RUNNING", "CAMPAIGN_STATE_STOPPED", "CAMPAIGN_STATE_MODERATION"}
-        filtered_campaigns = [c for c in campaigns if c.get("state") in active_states]
-        if not filtered_campaigns:
-            filtered_campaigns = campaigns
-
-        campaigns_by_id = {c["id"]: c for c in filtered_campaigns}
-        campaign_ids = list(campaigns_by_id.keys())
+        # Не фильтруем кампании по состоянию: исторические данные нужны и по
+        # архивным/остановленным кампаниям, иначе расход за прошлые дни теряется.
+        # Пропускаем только черновики (у них нет статистики).
+        #
+        # В отчёт /api/client/statistics можно передавать только кампании
+        # «Оплата за клик» (advObjectType=SKU). Кампании «Оплата за заказ»
+        # (advObjectType=SEARCH_PROMO, PaymentType=CPO) этот эндпоинт отклоняет:
+        #   "generation of this type of report is forbidden for the transferred list of campaigns"
+        # Для них нужен отдельный метод выгрузки (см. TODO ниже).
+        campaigns_by_id = {c["id"]: c for c in campaigns}
+        campaign_ids = [
+            cid for cid, c in campaigns_by_id.items()
+            if c.get("state") != "CAMPAIGN_STATE_DRAFT"
+            and c.get("advObjectType") == "SKU"
+        ]
 
         d_start = date.fromisoformat(date_from)
         d_end = date.fromisoformat(date_to)
-        all_rows = []
 
+        # Фаза 1: отправляем все отчёты сразу (API асинхронный, возвращает UUID).
+        # Озон генерирует их параллельно, поэтому не ждём каждый по очереди.
+        jobs: list[tuple[str, dict]] = []
         while d_start < d_end:
             chunk_end = min(d_start + timedelta(days=60), d_end)
             chunk_from = d_start.isoformat()
@@ -238,21 +295,109 @@ class PerformanceClient:
                 batch = campaign_ids[i : i + batch_size]
                 try:
                     uuid = self._create_stats_report(batch, chunk_from, chunk_to)
-                    report = self._poll_report(uuid, timeout=max_wait)
-                    if report:
-                        link = report.get("link", "")
-                        if link:
-                            rows = self._download_csv(link, campaigns_by_id)
-                            all_rows.extend(rows)
-                            logger.info("Batch %d/%d: %d rows",
-                                        i // batch_size + 1,
-                                        (len(campaign_ids) + batch_size - 1) // batch_size,
-                                        len(rows))
-                    time.sleep(2)
+                    jobs.append((uuid, campaigns_by_id))
                 except Exception as e:
-                    logger.warning("Batch %d failed: %s", i // batch_size + 1, e)
+                    logger.warning("Submit batch %s–%s failed: %s", chunk_from, chunk_to, e)
+                # Не шлём отчёты вплотную: Performance API жёстко рейт-лимитит
+                # генерацию, иначе получим 429 с долгим backoff.
+                time.sleep(5)
 
             d_start = chunk_end + timedelta(days=1)
 
+        logger.info("Submitted %d stats reports", len(jobs))
+
+        # Фаза 2: опрашиваем все отчёты параллельно.
+        reports = self._poll_reports(jobs, max_wait=max_wait)
+
+        # Фаза 3: качаем готовые CSV.
+        all_rows = []
+        for report, cbid in reports:
+            link = report.get("link", "")
+            if not link:
+                continue
+            try:
+                rows = self._download_csv(link, cbid)
+                all_rows.extend(rows)
+                logger.info("Downloaded %d rows", len(rows))
+            except Exception as e:
+                logger.warning("Download %s failed: %s", link, e)
+
         logger.info("Total ad stats: %d rows", len(all_rows))
         return all_rows
+
+    # ── Оплата за заказ (CPO) ──────────────────────────────────────────────
+
+    def _cpo_report_text(self, path: str, method: str, payload: dict = None,
+                         params: dict = None, max_wait: int = 120) -> str | None:
+        """Генерирует CPO-отчёт, дожидается готовности и возвращает текст CSV."""
+        if method == "POST":
+            headers = self._headers({"Content-Type": "application/json", "Accept": "application/json"})
+            resp = _request_with_retry("POST", f"{PERF_BASE}{path}", json=payload or {}, headers=headers, timeout=30, retries=10)
+        else:
+            headers = self._headers({"Accept": "application/json"})
+            resp = _request_with_retry("GET", f"{PERF_BASE}{path}", params=params or {}, headers=headers, timeout=30, retries=10)
+        resp.raise_for_status()
+        uuid = resp.json()["UUID"]
+        report = self._poll_report(uuid, timeout=max_wait)
+        if not report or not report.get("link"):
+            logger.warning("CPO report %s: no link", path)
+            return None
+        dl = _request_with_retry("GET", f"{PERF_BASE}{report['link']}",
+                                 headers=self._headers({"Accept": "*/*"}), timeout=60)
+        dl.raise_for_status()
+        return dl.text
+
+    def _parse_cpo_csv(self, text: str) -> list[dict]:
+        """Парсит CSV CPO-отчёта: ищет столбцы «Дата» и «Расход», возвращает [{date, spend}]."""
+        reader = csv.reader(io.StringIO(text), delimiter=";")
+        lines = [l for l in reader if l]
+        header_idx = None
+        for i, l in enumerate(lines):
+            cells = [(c or "") for c in l]
+            if any("Расход" in c for c in cells) and any("Дата" in c for c in cells):
+                header_idx = i
+                break
+        if header_idx is None:
+            return []
+        header = lines[header_idx]
+        i_date = next((i for i, c in enumerate(header) if "Дата" in (c or "")), -1)
+        i_spend = next((i for i, c in enumerate(header) if "Расход" in (c or "")), -1)
+        if i_date < 0 or i_spend < 0:
+            return []
+        rows = []
+        for l in lines[header_idx + 1:]:
+            if len(l) <= max(i_date, i_spend):
+                continue
+            date_cell = (l[i_date] or "").strip()
+            spend_cell = (l[i_spend] or "").strip()
+            if not date_cell or date_cell.lower().startswith("всего"):
+                continue
+            try:
+                d = datetime.strptime(date_cell, "%d.%m.%Y").date()
+            except (ValueError, TypeError):
+                continue
+            try:
+                spend = float(spend_cell.replace("\xa0", "").replace(",", ".")) if spend_cell else 0.0
+            except ValueError:
+                spend = 0.0
+            rows.append({"date": d, "spend": spend})
+        return rows
+
+    def get_cpo_orders(self, date_from: str, date_to: str, max_wait: int = 120) -> list[dict]:
+        """Расход «Оплата за заказ» по выбранным товарам — отчёт по заказам (по дням)."""
+        text = self._cpo_report_text(
+            "/api/client/statistic/orders/generate", "POST",
+            payload={"from": f"{date_from}T00:00:00Z", "to": f"{date_to}T23:59:59Z"},
+            max_wait=max_wait,
+        )
+        return self._parse_cpo_csv(text) if text else []
+
+    def get_cpo_all_products(self, date_from: str, date_to: str, max_wait: int = 120) -> list[dict]:
+        """Расход «Оплата за заказ» по всем товарам — отчёт по товарам (по дням)."""
+        text = self._cpo_report_text(
+            "/api/client/statistics/all_sku_promo/products/generate", "GET",
+            params={"timeBounds.from": f"{date_from}T00:00:00Z",
+                    "timeBounds.to": f"{date_to}T23:59:59Z"},
+            max_wait=max_wait,
+        )
+        return self._parse_cpo_csv(text) if text else []

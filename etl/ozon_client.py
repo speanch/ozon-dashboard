@@ -6,6 +6,7 @@ import os
 import re
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
@@ -18,37 +19,59 @@ BASE_URL = "https://api-seller.ozon.ru"
 
 SHOPS_CONFIG = {
     "ozon_stylint": {
-        "client_id": os.getenv("OZON_STYLINT_CLIENT_ID", "443362"),
-        "api_key": os.getenv("OZON_STYLINT_API_KEY", ""),
+        "client_id_env": "OZON_STYLINT_CLIENT_ID",
+        "client_id_default": "443362",
+        "api_key_env": "OZON_STYLINT_API_KEY",
     },
     "ozon_rs": {
-        "client_id": os.getenv("OZON_RS_CLIENT_ID", "3201725"),
-        "api_key": os.getenv("OZON_RS_API_KEY", ""),
+        "client_id_env": "OZON_RS_CLIENT_ID",
+        "client_id_default": "3201725",
+        "api_key_env": "OZON_RS_API_KEY",
     },
 }
 
 
 class OzonClient:
+    # Лимит Seller API — 2 запроса/сек на кабинет (client_id). Держим чуть ниже
+    # с запасом, чтобы не упираться в 429 и не тратить время на ретраи.
+    MIN_REQUEST_INTERVAL = 0.55
+
     def __init__(self, shop_name: str):
         if shop_name not in SHOPS_CONFIG:
             raise ValueError(f"Unknown shop: {shop_name}")
         cfg = SHOPS_CONFIG[shop_name]
-        if not cfg["api_key"]:
+        # Читаем креды лениво (в момент создания клиента), а не на импорте модуля:
+        # иначе load_dotenv() после импорта не подхватит ключи.
+        client_id = os.getenv(cfg["client_id_env"], cfg["client_id_default"])
+        api_key = os.getenv(cfg["api_key_env"], "")
+        if not api_key:
             logger.warning("OzonClient %s: API key is empty — requests will fail", shop_name)
         self.shop_name = shop_name
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "Client-Id": cfg["client_id"],
-                "Api-Key": cfg["api_key"],
+                "Client-Id": client_id,
+                "Api-Key": api_key,
                 "Content-Type": "application/json",
             }
         )
+        self._last_request = 0.0
+        self._throttle_lock = threading.Lock()
+
+    def _throttle(self):
+        """Держит не чаще MIN_REQUEST_INTERVAL между запросами к одному кабинету."""
+        with self._throttle_lock:
+            now = time.monotonic()
+            wait = self._last_request + self.MIN_REQUEST_INTERVAL - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request = time.monotonic()
 
     def _post_raw(self, path: str, payload: dict, timeout: int = 30, retries: int = 3):
         """POST с ретраями на 429 (rate limit Seller API: 2 req/sec)."""
         url = urljoin(BASE_URL, path)
         for attempt in range(retries):
+            self._throttle()
             resp = self.session.post(url, json=payload, timeout=timeout)
             if resp.status_code == 429:
                 wait = 2.0 * (attempt + 1)
@@ -86,6 +109,7 @@ class OzonClient:
         """GET с ретраями на 429 (rate limit Seller API: 2 req/sec)."""
         url = urljoin(BASE_URL, path)
         for attempt in range(retries):
+            self._throttle()
             resp = self.session.get(url, timeout=timeout)
             if resp.status_code == 429:
                 wait = 2.0 * (attempt + 1)
@@ -120,29 +144,31 @@ class OzonClient:
         date_from = date_to - timedelta(days=days_back)
 
         all_postings = []
-        limit = 1000
-        offset = 0
+        limit = 100
+        cursor = ""
 
         while True:
             payload = {
-                "dir": "ASC",
+                "sort_dir": "ASC",
                 "filter": {
                     "since": date_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "to": date_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 },
                 "limit": limit,
-                "offset": offset,
                 "with": {"analytics_data": True, "barcodes": False, "financial_data": True},
             }
+            if cursor:
+                payload["cursor"] = cursor
 
-            postings = self._post("/v3/posting/fbs/list", payload)
-            result = postings.get("result") or {}
-            postings_list = result.get("postings", [])
+            data = self._post("/v4/posting/fbs/list", payload)
+            postings_list = data.get("postings", [])
             all_postings.extend(postings_list)
 
-            if not result.get("has_next") or len(postings_list) < limit:
+            if not data.get("has_next"):
                 break
-            offset += limit
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
 
         parsed = []
         for posting in all_postings:
@@ -169,6 +195,17 @@ class OzonClient:
 
             prr_option = {}
             detailed_financial = None
+            # v4 list: prr_option — строка ("lift"/"stairs"/"none"/"delivery_default").
+            list_prr = posting.get("prr_option") or ""
+            elevator_map = {
+                "lift": "passenger",
+                "cargo_lift": "cargo",
+                "stairs": "no",
+                "none": "no",
+                "delivery_default": "no",
+            }
+            elevator = elevator_map.get(list_prr, "no")
+            prr_floor = ""
 
             if (
                 posting_number
@@ -190,6 +227,11 @@ class OzonClient:
                     get_result = detail.get("result", {})
                     prr_option = get_result.get("prr_option") or {}
                     detailed_financial = get_result.get("financial_data")
+                    # Детальный ответ точнее (может быть cargo_lift) и содержит этаж.
+                    if prr_option.get("code"):
+                        elevator = elevator_map.get(prr_option.get("code"), elevator)
+                    if prr_option.get("floor"):
+                        prr_floor = str(prr_option.get("floor"))
                     cust = get_result.get("customer") or {}
                     if cust.get("phone"):
                         customer["phone"] = cust["phone"]
@@ -200,10 +242,6 @@ class OzonClient:
                         address["address_tail"] = a["address_tail"]
                 except Exception as e:
                     logger.error("fbs/get failed for %s: %s", posting_number, e)
-
-            elevator_code = prr_option.get("code", "")
-            elevator_map = {"lift": "passenger", "cargo_lift": "cargo", "stairs": "no"}
-            elevator = elevator_map.get(elevator_code, "no")
 
             financial = detailed_financial or posting.get("financial_data") or {}
             products_data = []
@@ -229,7 +267,7 @@ class OzonClient:
                     "customer_comment": address.get("comment", ""),
                     "distance_mkad": distance_mkad,
                     "elevator": elevator,
-                    "floor": prr_option.get("floor", ""),
+                    "floor": prr_floor,
                     "products": products_data,
                     "financial_data": financial,
                     "order_source": "fbs",
@@ -363,7 +401,6 @@ class OzonClient:
             if len(rows) < limit:
                 break
             offset += limit
-            time.sleep(0.6)
 
         if first_resp and "result" in first_resp:
             if "data" in first_resp["result"]:
@@ -576,7 +613,6 @@ class OzonClient:
             last_id = result.get("last_id")
             if not last_id:
                 break
-            time.sleep(0.6)
         return products
 
     def get_product_info_by_product_id(self, product_ids: list) -> dict:
@@ -602,5 +638,17 @@ class OzonClient:
                             "sku": item.get("sku"),
                             "name": item.get("name"),
                         }
-            time.sleep(0.6)
         return mapping
+
+    def update_prices(self, prices: list[dict]) -> list[dict]:
+        """
+        POST /v1/product/import/prices — обновить цены (включая min_price).
+        Батчами по 1000 товаров за запрос.
+        prices: список словарей {"offer_id", "price", "min_price", "currency_code", "auto_action_enabled", ...}.
+        Возвращает список ответов API (по одному на батч).
+        """
+        responses = []
+        for i in range(0, len(prices), 1000):
+            batch = prices[i:i + 1000]
+            responses.append(self._post("/v1/product/import/prices", {"prices": batch}))
+        return responses

@@ -3,7 +3,7 @@ import calendar as cal
 import json
 import logging
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 from .models import (
     Order,
@@ -16,6 +16,7 @@ from .models import (
     ProductPrice,
     ProductMapping,
     BoostSnapshot,
+    EtlState,
     get_session,
 )
 from .ozon_client import OzonClient
@@ -30,6 +31,25 @@ def _date_range(days_back: int) -> tuple[str, str]:
         (today - timedelta(days=days_back)).isoformat() + "T00:00:00Z",
         today.isoformat() + "T23:59:59Z",
     )
+
+
+# Дни перекрытия при инкрементальной догрузке: Ozon может корректировать
+# аналитику и финансы задним числом (возвраты, отмены), поэтому берём с запасом.
+WATERMARK_OVERLAP_DAYS = 3
+
+
+def _get_last_sync(session, key: str):
+    row = session.query(EtlState).filter_by(key=key).first()
+    return row.last_sync if row else None
+
+
+def _set_last_sync(session, key: str, value):
+    row = session.query(EtlState).filter_by(key=key).first()
+    if row:
+        row.last_sync = value
+        row.updated_at = datetime.now(timezone.utc)
+    else:
+        session.add(EtlState(key=key, last_sync=value))
 
 
 def sync_orders(session, shops: list[str] = None, days_back: int = 30):
@@ -81,6 +101,16 @@ def sync_orders(session, shops: list[str] = None, days_back: int = 30):
             merged_products = []
             for i, meta in enumerate(products_meta):
                 fp = fin_products[i] if i < len(fin_products) else {}
+                # Комиссия приходит в двух видах:
+                #   v3 /fbs/get: плоские commission_amount / commission_percent;
+                #   v4 /fbs/list: вложенный commission: {amount, percent, currency}.
+                comm = fp.get("commission") or {}
+                commission_amount = fp.get("commission_amount")
+                if commission_amount is None:
+                    commission_amount = comm.get("amount", 0) or 0
+                commission_percent = fp.get("commission_percent")
+                if commission_percent is None:
+                    commission_percent = comm.get("percent", 0) or 0
                 merged_products.append({
                     "offer_id": meta.get("sku"),
                     "name": meta.get("name"),
@@ -89,8 +119,8 @@ def sync_orders(session, shops: list[str] = None, days_back: int = 30):
                     "old_price": fp.get("old_price"),
                     "discount_value": fp.get("total_discount_value"),
                     "discount_percent": fp.get("total_discount_percent"),
-                    "commission_amount": fp.get("commission_amount"),
-                    "commission_percent": fp.get("commission_percent"),
+                    "commission_amount": commission_amount,
+                    "commission_percent": commission_percent,
                     "payout": fp.get("payout"),
                     "actions": fp.get("actions", []),
                 })
@@ -128,13 +158,22 @@ def sync_analytics(session, shops: list[str] = None, days_back: int = 30):
     if shops is None:
         shops = list(DEFAULT_SHOPS)
 
-    date_from, date_to = _date_range(days_back)
+    today = date.today()
+    _, date_to = _date_range(days_back)
 
     for shop in shops:
         try:
             client = OzonClient(shop)
         except ValueError:
             continue
+
+        # Инкрементальная догрузка от последнего успешного запуска (с перекрытием).
+        key = f"analytics:{shop}"
+        last = _get_last_sync(session, key)
+        if last is not None:
+            date_from = (last - timedelta(days=WATERMARK_OVERLAP_DAYS)).isoformat() + "T00:00:00Z"
+        else:
+            date_from = (today - timedelta(days=days_back)).isoformat() + "T00:00:00Z"
 
         data = client.get_analytics_data(
             date_from=date_from,
@@ -184,20 +223,22 @@ def sync_analytics(session, shops: list[str] = None, days_back: int = 30):
                 existing.product_name = product_name
                 existing.raw_json = json.dumps(row, ensure_ascii=False)
             else:
-                session.add(
-                    DailyMetric(
-                        shop=shop,
-                        date=day,
-                        sku=sku,
-                        product_name=product_name,
-                        revenue=float(metrics[0]) if len(metrics) > 0 else 0,
-                        ordered_units=int(metrics[1]) if len(metrics) > 1 else 0,
-                        returns=0,
-                        cancellations=0,
-                        raw_json=json.dumps(row, ensure_ascii=False),
-                    )
+                m = DailyMetric(
+                    shop=shop,
+                    date=day,
+                    sku=sku,
+                    product_name=product_name,
+                    revenue=float(metrics[0]) if len(metrics) > 0 else 0,
+                    ordered_units=int(metrics[1]) if len(metrics) > 1 else 0,
+                    returns=0,
+                    cancellations=0,
+                    raw_json=json.dumps(row, ensure_ascii=False),
                 )
+                session.add(m)
+                existing_metrics[(day, sku)] = m
 
+        session.commit()
+        _set_last_sync(session, key, today)
         session.commit()
 
 
@@ -255,7 +296,8 @@ def sync_finance(session, shops: list[str] = None, days_back: int = 30):
     if shops is None:
         shops = list(DEFAULT_SHOPS)
 
-    date_from, date_to = _date_range(days_back)
+    today = date.today()
+    full_from, full_to = _date_range(days_back)
 
     for shop in shops:
         if not is_premium(shop):
@@ -266,6 +308,16 @@ def sync_finance(session, shops: list[str] = None, days_back: int = 30):
             client = OzonClient(shop)
         except ValueError:
             continue
+
+        # Инкрементальная догрузка транзакций от последнего запуска (с перекрытием).
+        # Cash flow ниже всегда тянем за полное окно — его дедуп завязан на period_start/end.
+        key = f"finance:{shop}"
+        last = _get_last_sync(session, key)
+        if last is not None:
+            date_from = (last - timedelta(days=WATERMARK_OVERLAP_DAYS)).isoformat() + "T00:00:00Z"
+        else:
+            date_from = full_from
+        date_to = full_to
 
         # Транзакции — по месяцам (ограничение API: 30 дней)
         current = date.fromisoformat(date_from[:10])
@@ -336,14 +388,14 @@ def sync_finance(session, shops: list[str] = None, days_back: int = 30):
             else:
                 current = date(current.year, current.month + 1, 1)
 
-        # Движение денежных средств
-        cash_flows = client.get_cash_flow(date_from, date_to)
+        # Движение денежных средств — всегда за полное окно.
+        cash_flows = client.get_cash_flow(full_from, full_to)
         if cash_flows is None:
             logger.info("[%s] Cash flow: no access", shop)
         else:
             logger.info("[%s] Fetched %d cash flow entries", shop, len(cash_flows))
-            ps = date.fromisoformat(date_from[:10])
-            pe = date.fromisoformat(date_to[:10])
+            ps = date.fromisoformat(full_from[:10])
+            pe = date.fromisoformat(full_to[:10])
 
             existing_cfs = {
                 (c.cash_flow_type, c.operation, c.amount): c
@@ -371,13 +423,19 @@ def sync_finance(session, shops: list[str] = None, days_back: int = 30):
                     )
 
         session.commit()
+        _set_last_sync(session, key, today)
+        session.commit()
 
 
 def sync_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
     """Синхронизация рекламной статистики из Performance API."""
     from .performance_client import PerformanceClient
 
-    date_to = date.today()
+    # Данные Performance API за текущий день предварительные и завышенные
+    # (пустые SKU со сводными значениями), Ozon корректирует их на следующий день.
+    # Поэтому тянем статистику только до вчерашнего дня включительно.
+    today = date.today()
+    date_to = today - timedelta(days=1)
     date_from = date_to - timedelta(days=days_back)
 
     try:
@@ -393,69 +451,156 @@ def sync_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
         return
     logger.info("Ads: fetched %d stats rows", len(rows))
 
-    existing_ads = {
-        (a.date, a.campaign_id, a.sku): a
-        for a in session.query(AdDailyStats)
+    def _parse_date(date_str: str):
+        date_str = (date_str or "").replace("\xa0", "").replace("\u00a0", "").strip()
+        try:
+            return date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            try:
+                return datetime.strptime(date_str, "%d.%m.%Y").date()
+            except (ValueError, TypeError):
+                return None
+
+    # Агрегируем строки по (date, campaign_id, sku): отчёт может отдавать
+    # несколько строк на один ключ (например, положительный расход и строку
+    # корректировки с отрицательным значением). Иначе получаются дубликаты.
+    SUM_FIELDS = (
+        "impressions", "clicks", "cart_adds", "units_sold",
+        "spend", "promo_revenue", "total_order_amount",
+    )
+    RATE_FIELDS = ("ctr", "avg_cpc", "promo_acos", "overall_acos")
+
+    merged: dict[tuple, dict] = {}
+    for row in rows:
+        d = _parse_date(row.get("date", ""))
+        if d is None:
+            continue
+        key = (
+            d,
+            row.get("campaign_id") or "",
+            row.get("sku") or "",
+        )
+        if key not in merged:
+            merged[key] = dict(row)
+        else:
+            tgt = merged[key]
+            for f in SUM_FIELDS:
+                tgt[f] = (tgt.get(f) or 0) + (row.get(f) or 0)
+            for f in RATE_FIELDS:
+                try:
+                    new_v = float(row.get(f) or 0)
+                    old_v = float(tgt.get(f) or 0)
+                except (ValueError, TypeError):
+                    new_v = old_v = 0.0
+                tgt[f] = row.get(f) if abs(new_v) > abs(old_v) else tgt.get(f)
+
+    if not merged:
+        return
+
+    # Полное обновление для успешно выгруженных кампаний: удаляем старые строки
+    # этих кампаний в окне и вставляем свежие. Иначе «протухшие» строки
+    # (например, ошибочно завышенные значения за день, которые Ozon потом исправил)
+    # оставались бы в базе навсегда.
+    fetched_cids = {cid for (_, cid, _) in merged}
+    deleted = (
+        session.query(AdDailyStats)
         .filter(
             AdDailyStats.shop == shop,
             AdDailyStats.date >= date_from,
-            AdDailyStats.date <= date_to
+            AdDailyStats.date <= date_to,
+            AdDailyStats.campaign_id.in_(fetched_cids),
         )
-        .all()
+        .delete(synchronize_session=False)
+    )
+    logger.info("Ads: deleted %d stale rows for %d campaigns", deleted, len(fetched_cids))
+
+    # Убираем строки за «сегодня» и позже — это предварительные завышенные данные.
+    session.query(AdDailyStats).filter(
+        AdDailyStats.shop == shop,
+        AdDailyStats.date >= today,
+        AdDailyStats.campaign_id != "cpo",
+    ).delete(synchronize_session=False)
+
+    for (d, cid, sku), row in merged.items():
+        session.add(
+            AdDailyStats(
+                shop=shop,
+                date=d,
+                campaign_id=cid,
+                campaign_name=row.get("campaign_name", ""),
+                sku=sku,
+                product_name=row.get("product_name", ""),
+                impressions=row.get("impressions", 0),
+                clicks=row.get("clicks", 0),
+                ctr=row.get("ctr", 0.0),
+                cart_adds=row.get("cart_adds", 0),
+                avg_cpc=row.get("avg_cpc", 0.0),
+                spend=row.get("spend", 0.0),
+                units_sold=row.get("units_sold", 0),
+                promo_revenue=row.get("promo_revenue", 0.0),
+                total_order_amount=row.get("total_order_amount", 0.0),
+                promo_acos=row.get("promo_acos", 0.0),
+                overall_acos=row.get("overall_acos", 0.0),
+            )
+        )
+
+    session.commit()
+
+
+def sync_cpo_ads(session, shop: str = "ozon_stylint", days_back: int = 30):
+    """Синхронизация расхода «Оплата за заказ» (CPO/SEARCH_PROMO) из Performance API.
+
+    Стандартный /api/client/statistics отклоняет кампании «Оплата за заказ», поэтому
+    расход берётся из двух отдельных отчётов и складывается в AdDailyStats с
+    campaign_id='cpo' (по дням).
+    """
+    from .performance_client import PerformanceClient
+
+    date_to = date.today()
+    date_from = date_to - timedelta(days=days_back)
+
+    try:
+        client = PerformanceClient(shop)
+    except Exception as e:
+        logger.warning("Performance API: auth failed — %s", e)
+        return
+
+    rows = []
+    try:
+        rows = client.get_cpo_orders(date_from.isoformat(), date_to.isoformat(), max_wait=300)
+    except Exception as e:
+        logger.warning("[%s] CPO orders failed — %s", shop, e)
+    try:
+        rows += client.get_cpo_all_products(date_from.isoformat(), date_to.isoformat(), max_wait=300)
+    except Exception as e:
+        logger.warning("[%s] CPO all products failed — %s", shop, e)
+
+    daily: dict = {}
+    for r in rows:
+        daily[r["date"]] = daily.get(r["date"], 0.0) + (r.get("spend") or 0.0)
+    logger.info("[%s] CPO: %d rows → %d days", shop, len(rows), len(daily))
+
+    existing = {
+        (a.date, a.campaign_id or "", a.sku or ""): a
+        for a in session.query(AdDailyStats).filter(
+            AdDailyStats.shop == shop,
+            AdDailyStats.campaign_id == "cpo",
+            AdDailyStats.date >= date_from,
+            AdDailyStats.date <= date_to,
+        ).all()
     }
-
-    for row in rows:
-        date_str = row["date"].replace("\xa0", "").replace("\u00a0", "").strip()
-        try:
-            d = date.fromisoformat(date_str)
-        except (ValueError, TypeError):
-            try:
-                d = datetime.strptime(date_str, "%d.%m.%Y").date()
-            except (ValueError, TypeError):
-                d = date.today()
-
-        cid = row.get("campaign_id", "")
-        sku = row.get("sku", "")
-
-        existing = existing_ads.get((d, cid, sku))
-        if existing:
-            # Update existing records with latest metrics
-            existing.campaign_name = row.get("campaign_name", "")
-            existing.product_name = row.get("product_name", "")
-            existing.impressions = row.get("impressions", 0)
-            existing.clicks = row.get("clicks", 0)
-            existing.ctr = row.get("ctr", 0.0)
-            existing.cart_adds = row.get("cart_adds", 0)
-            existing.avg_cpc = row.get("avg_cpc", 0.0)
-            existing.spend = row.get("spend", 0.0)
-            existing.units_sold = row.get("units_sold", 0)
-            existing.promo_revenue = row.get("promo_revenue", 0.0)
-            existing.total_order_amount = row.get("total_order_amount", 0.0)
-            existing.promo_acos = row.get("promo_acos", 0.0)
-            existing.overall_acos = row.get("overall_acos", 0.0)
+    for d, spend in daily.items():
+        key = (d, "cpo", "")
+        e = existing.get(key)
+        if e:
+            e.spend = spend
         else:
             session.add(
                 AdDailyStats(
-                    shop=shop,
-                    date=d,
-                    campaign_id=cid,
-                    campaign_name=row.get("campaign_name", ""),
-                    sku=sku,
-                    product_name=row.get("product_name", ""),
-                    impressions=row.get("impressions", 0),
-                    clicks=row.get("clicks", 0),
-                    ctr=row.get("ctr", 0.0),
-                    cart_adds=row.get("cart_adds", 0),
-                    avg_cpc=row.get("avg_cpc", 0.0),
-                    spend=row.get("spend", 0.0),
-                    units_sold=row.get("units_sold", 0),
-                    promo_revenue=row.get("promo_revenue", 0.0),
-                    total_order_amount=row.get("total_order_amount", 0.0),
-                    promo_acos=row.get("promo_acos", 0.0),
-                    overall_acos=row.get("overall_acos", 0.0),
+                    shop=shop, date=d, campaign_id="cpo",
+                    campaign_name="Оплата за заказ", sku="", spend=spend,
                 )
             )
-
     session.commit()
 
 
@@ -630,6 +775,7 @@ def sync_prices(session, shops: list[str] = None):
                 existing.min_price = float(price_info.get("min_price", 0) or 0)
                 existing.marketing_price = float(price_info.get("marketing_seller_price", 0) or 0)
                 existing.retail_price = float(price_info.get("retail_price", 0) or 0)
+                existing.net_price = float(price_info.get("net_price", 0) or 0)
                 existing.price_index = float(ozon_index.get("price_index_value", 0) or 0)
                 existing.color_index = price_indexes.get("color_index", "")
                 existing.commission_fbo = float(commissions.get("sales_percent_fbo", 0) or 0)
@@ -647,6 +793,7 @@ def sync_prices(session, shops: list[str] = None):
                         min_price=float(price_info.get("min_price", 0) or 0),
                         marketing_price=float(price_info.get("marketing_seller_price", 0) or 0),
                         retail_price=float(price_info.get("retail_price", 0) or 0),
+                        net_price=float(price_info.get("net_price", 0) or 0),
                         price_index=float(ozon_index.get("price_index_value", 0) or 0),
                         color_index=price_indexes.get("color_index", ""),
                         commission_fbo=float(commissions.get("sales_percent_fbo", 0) or 0),
@@ -713,39 +860,50 @@ def sync_product_mapping(session, shops: list[str] = None):
 
 
 def run_pipeline(shops: list[str] = None, days_back: int = 30, fast: bool = False):
-    """Запуск полного ETL-пайплайна. fast=True — без аналитики и рекламы (медленные/rate-limited)."""
+    """Запуск полного ETL-пайплайна. fast=True — без аналитики и рекламы (медленные/rate-limited).
+
+    Кабинеты синхронизируются параллельно (у каждого свой rate limit и своя сессия БД).
+    """
     from dotenv import load_dotenv; load_dotenv()
+    from concurrent.futures import ThreadPoolExecutor
+    from sqlalchemy.orm import sessionmaker
     from .models import init_db
 
     if shops is None:
         shops = list(DEFAULT_SHOPS)
 
     engine = init_db()
-    session = get_session(engine)
+    Session = sessionmaker(bind=engine)
 
+    def _run_shop(shop: str):
+        session = Session()
+        try:
+            logger.info("[%s] pipeline start", shop)
+            sync_orders(session, [shop], days_back)
+            if not fast:
+                sync_analytics(session, [shop], days_back)
+            sync_stocks(session, [shop])
+            sync_finance(session, [shop], days_back)
+            sync_balance(session, [shop])
+            sync_boost(session, [shop])
+            sync_prices(session, [shop])
+
+            if not fast and has_performance_api(shop):
+                sync_ads(session, shop, days_back)
+                sync_cpo_ads(session, shop, days_back)
+
+            sync_product_mapping(session, [shop])
+            logger.info("[%s] pipeline done", shop)
+        except Exception:
+            logger.exception("[%s] pipeline failed", shop)
+            session.rollback()
+        finally:
+            session.close()
+
+    logger.info("=== ETL START ===")
     try:
-        logger.info("=== ETL START ===")
-        sync_orders(session, shops, days_back)
-        if not fast:
-            sync_analytics(session, shops, days_back)
-        sync_stocks(session, shops)
-        sync_finance(session, shops, days_back)
-        sync_balance(session, shops)
-        sync_boost(session, shops)
-        sync_prices(session, shops)
-
-        if not fast:
-            for shop in shops:
-                if has_performance_api(shop):
-                    sync_ads(session, shop, days_back)
-
-        sync_product_mapping(session, shops)
-
-        logger.info("=== ETL DONE ===")
-        logger.info("Dispose engine done")
-    except Exception as e:
-        logger.exception("ETL failed: %s", e)
-        session.rollback()
+        with ThreadPoolExecutor(max_workers=len(shops)) as ex:
+            list(ex.map(_run_shop, shops))
     finally:
-        session.close()
         engine.dispose()
+    logger.info("=== ETL DONE ===")

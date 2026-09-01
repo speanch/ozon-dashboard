@@ -16,3 +16,7 @@ snapshots/
 .idea/
 .vscode/
 .DS_Store
+
+# Выгрузки и отчёты с бизнес-данными
+reports/
+temp/

@@ -10,9 +10,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from etl.models import init_db, get_session, Order, DailyMetric, AdDailyStats, FinanceBalance
-from etl.config import SHOP_LABELS, SHOP_COLORS, STATUS_LABELS
-from etl.shared_ui import build_presets, date_filter_section_with_shops
+from etl.models import init_db, get_session, Order, DailyMetric, AdDailyStats, FinanceBalance, ProductPrice
+from etl.config import SHOP_LABELS, SHOP_COLORS, STATUS_LABELS, order_shops, FULL_COST_MULTIPLIER
+from etl.shared_ui import build_presets, date_filter_section_with_shops, resample_daily, GRANULARITIES, GRAN_TICKFMT, build_net_price_asof
 
 st.title("Обзор Ozon")
 
@@ -27,8 +27,11 @@ orders_raw = session.query(Order).all()
 analytics_raw = session.query(DailyMetric).all()
 ads_raw = session.query(AdDailyStats).all()
 balance_raw = session.query(FinanceBalance).all()
+prices_raw = session.query(ProductPrice).all()
 session.close()
 engine.dispose()
+
+net_price_asof = build_net_price_asof(prices_raw)
 
 # ── последний баланс по каждому кабинету ─────────────────────────────────
 
@@ -76,6 +79,12 @@ for o in orders_raw:
     discounts = [p.get("discount_value", 0) or 0 for p in products]
     commissions = [p.get("commission_amount", 0) or 0 for p in products]
 
+    order_date = o.order_date.date() if o.order_date else None
+    cost = sum(
+        net_price_asof(o.marketplace, p.get("offer_id"), order_date) * (p.get("quantity", 1) or 1)
+        for p in products
+    )
+
     rows.append({
         "posting_number": o.name,
         "marketplace": o.marketplace,
@@ -92,7 +101,8 @@ for o in orders_raw:
         "ozon_price_sum": sum(p.get("price", 0) * p.get("quantity", 1) for p in products),
         "ozon_old_price_sum": sum(p.get("old_price", 0) * p.get("quantity", 1) for p in products),
         "ozon_discount_sum": sum(p.get("discount_value", 0) * p.get("quantity", 1) for p in products),
-        "ozon_commission_sum": sum(abs(p.get("commission_amount", 0)) for p in products),
+        "ozon_commission_sum": sum(abs(p.get("commission_amount", 0) or 0) for p in products),
+        "cost": cost,
         "products_json": products,
     })
 
@@ -122,7 +132,7 @@ max_d = df["order_date"].max().date()
 
 presets = build_presets(min_d, max_d)
 
-marketplaces = sorted(df["marketplace"].unique().tolist())
+marketplaces = order_shops(df["marketplace"].unique().tolist())
 statuses = sorted(df["status"].unique().tolist())
 active = {"awaiting_packaging", "awaiting_deliver", "delivering", "delivered"}
 default_statuses = [s for s in statuses if s in active]
@@ -148,33 +158,87 @@ st.caption(
 
 # ── 1. Ключевые показатели ────────────────────────────────────────────────
 
-st.subheader("Ключевые показатели")
+st.subheader("Ключевые показатели за период")
 
 total_orders = len(filtered)
 total_revenue = filtered["ozon_price_sum"].sum()
+total_cost = filtered["cost"].sum()
+total_profit = total_revenue - total_cost * FULL_COST_MULTIPLIER
 
-k1, k2 = st.columns(2)
+k1, k2, k3 = st.columns(3)
 k1.metric("Заказов", total_orders, help="Количество заказов за выбранный период.")
 k2.metric("Выручка", f"{total_revenue:,.0f} ₽", help="Сумма продаж (цена × количество).")
+k3.metric("Прибыль", f"{total_profit:,.0f} ₽", help="Прибыль = выручка − полная себестоимость (себестоимость × 1.795: +55% комиссия, +15% ДРР, +7% налог, +2.5% эквайринг).")
+
+SHOP_CARD_BG = {"ozon_stylint": "#f2f4f7", "ozon_rs": "#e1e5ec"}
+
+def _shop_card(shop: str, fields: list[tuple[str, str]]) -> None:
+    label = SHOP_LABELS.get(shop, shop)
+    bg = SHOP_CARD_BG.get(shop, "#f2f4f7")
+    field_html = "".join(
+        f"""
+        <div>
+          <div style="font-size:0.8rem; color:#5a6b80;">{caption}</div>
+          <div style="font-size:1.75rem; font-weight:600; color:#001a34;">{value}</div>
+        </div>
+        """
+        for caption, value in fields
+    )
+    st.html(
+        f"""
+        <div style="background-color:{bg}; border-radius:8px; padding:14px 16px; margin-bottom:10px;">
+          <div style="font-size:0.95rem; font-weight:600; color:#001a34; margin-bottom:10px;">{label}</div>
+          <div style="display:flex; gap:32px; flex-wrap:wrap;">{field_html}</div>
+        </div>
+        """
+    )
 
 for mp in selected_mp:
     mp_data = filtered[filtered["marketplace"] == mp]
     mp_orders = len(mp_data)
     mp_revenue = mp_data["ozon_price_sum"].sum()
     mp_avg = mp_revenue / mp_orders if mp_orders > 0 else 0
-    mp_balance = balances.get(mp)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"{SHOP_LABELS.get(mp, mp)} · заказов", mp_orders)
-    c2.metric(f"{SHOP_LABELS.get(mp, mp)} · выручка", f"{mp_revenue:,.0f} ₽")
-    c3.metric(
-        f"{SHOP_LABELS.get(mp, mp)} · средний чек", f"{mp_avg:,.0f} ₽",
-        help="Выручка ÷ количество заказов — средняя сумма одного заказа.",
+    mp_cost = mp_data["cost"].sum()
+    mp_profit = mp_revenue - mp_cost * FULL_COST_MULTIPLIER
+
+    mp_base = (
+        (df["marketplace"] == mp)
+        & (df["order_date"].dt.date >= date_from)
+        & (df["order_date"].dt.date <= date_to)
     )
-    c4.metric(
-        f"{SHOP_LABELS.get(mp, mp)} · баланс",
-        f"{mp_balance:,.0f} ₽" if mp_balance is not None else "н/д",
-        help="Текущий баланс кабинета Ozon (начисления минус списания).",
-    )
+    mp_rev_all = df[mp_base]["ozon_price_sum"].sum()
+    mp_rev_accepted = df[mp_base & (df["status"] != "cancelled")]["ozon_price_sum"].sum()
+
+    if not ads_df.empty:
+        mp_ads = ads_df[
+            (ads_df["shop"] == mp)
+            & (ads_df["date"] >= date_from)
+            & (ads_df["date"] <= date_to)
+        ]
+        if mp_ads.empty:
+            mp_spend_str = drr_all_str = drr_accepted_str = mp_promo_str = "н/д"
+        else:
+            mp_spend = mp_ads["spend"].sum()
+            mp_spend_str = f"{mp_spend:,.0f} ₽"
+            mp_promo_revenue = mp_ads[mp_ads["sku"].fillna("").astype(str) != ""]["promo_revenue"].sum()
+            mp_promo_str = f"{mp_promo_revenue:,.0f} ₽"
+            drr_all = (mp_spend / mp_rev_all * 100) if mp_rev_all > 0 else 0
+            drr_accepted = (mp_spend / mp_rev_accepted * 100) if mp_rev_accepted > 0 else 0
+            drr_all_str = f"{drr_all:.2f}%"
+            drr_accepted_str = f"{drr_accepted:.2f}%"
+    else:
+        mp_spend_str = drr_all_str = drr_accepted_str = mp_promo_str = "н/д"
+
+    _shop_card(mp, [
+        ("Заказов", str(mp_orders)),
+        ("Выручка", f"{mp_revenue:,.0f} ₽"),
+        ("Прибыль", f"{mp_profit:,.0f} ₽"),
+        ("Средний чек", f"{mp_avg:,.0f} ₽"),
+        ("Выручка с рекламы", mp_promo_str),
+        ("Затраты на рекламу", mp_spend_str),
+        ("Общий ДРР (все заказы)", drr_all_str),
+        ("Общий ДРР (принятые)", drr_accepted_str),
+    ])
 
 st.divider()
 
@@ -210,16 +274,20 @@ def _active_campaigns() -> set[str]:
             pass
     return ids
 
-rk1, rk2 = st.columns(2)
-for idx, shop in enumerate(["ozon_stylint", "ozon_rs"]):
+st.subheader("Рейтинг и баланс")
+st.caption("Рейтинг и баланс — текущие показатели, не зависящие от выбранного периода.")
+
+for shop in ["ozon_stylint", "ozon_rs"]:
     if shop not in selected_mp:
         continue
     rating = seller_ratings.get(shop)
-    col = rk1 if idx == 0 else rk2
-    if rating is not None:
-        col.metric(f"{SHOP_LABELS.get(shop, shop)} · рейтинг", f"{rating:.2f} ★")
-    else:
-        col.metric(f"{SHOP_LABELS.get(shop, shop)} · рейтинг", "н/д")
+    rating_str = f"{rating:.2f} ★" if rating is not None else "н/д"
+    mp_balance = balances.get(shop)
+    balance_str = f"{mp_balance:,.0f} ₽" if mp_balance is not None else "н/д"
+    _shop_card(shop, [
+        ("Рейтинг", rating_str),
+        ("Баланс", balance_str),
+    ])
 
 st.divider()
 
@@ -305,10 +373,13 @@ if not ads_df.empty:
 
         drr_ch1, drr_ch2 = st.columns(2)
         with drr_ch1:
+            ads_gran = st.selectbox("Деление оси X", GRANULARITIES, index=0, key="ads_gran")
             daily_ads = ads_mp.groupby("date").agg(
                 spend=("spend", "sum"), revenue=("total_order_amount", "sum")
             ).reset_index()
             if not daily_ads.empty:
+                daily_ads["_g"] = 1
+                daily_ads = resample_daily(daily_ads, ads_gran, "_g", ["spend", "revenue"])
                 daily_ads["acos"] = daily_ads.apply(
                     lambda r: r["spend"] / r["revenue"] * 100 if r["revenue"] > 0 else 0, axis=1
                 )
@@ -317,6 +388,7 @@ if not ads_df.empty:
                     barmode="group", title="Расходы и выручка с рекламы"
                 )
                 fig_ads.update_layout(xaxis_title=None, height=300, legend=dict(orientation="h"))
+                fig_ads.update_xaxes(tickformat=GRAN_TICKFMT.get(ads_gran, "%d.%m"))
                 st.plotly_chart(fig_ads, width="stretch")
 
         with drr_ch2:
@@ -405,9 +477,9 @@ with chart_col3:
 
 st.divider()
 
-# ── 5. Топ-5 товаров ──────────────────────────────────────────────────────
+# ── 5. Топ-10 товаров ─────────────────────────────────────────────────────
 
-st.subheader("Топ-5 товаров по количеству продаж")
+st.subheader("Топ-10 товаров по количеству продаж")
 
 if all_products_raw:
     prod_df = pd.DataFrame(all_products_raw)
@@ -424,6 +496,13 @@ if all_products_raw:
     # all time
     prod_all = prod_df[prod_df["marketplace"].isin(selected_mp)]
 
+    top_col_config = {
+        "Товар": st.column_config.TextColumn(width="medium"),
+        "Артикул": st.column_config.TextColumn(width="small"),
+        "Продано": st.column_config.NumberColumn(width="small"),
+        "Выручка": st.column_config.NumberColumn(width="small", format="₽ %,.0f"),
+    }
+
     col5a, col5b = st.columns(2)
 
     with col5a:
@@ -432,7 +511,7 @@ if all_products_raw:
             prod_filtered.groupby(["name", "offer_id"])
             .agg(quantity=("quantity", "sum"), revenue=("price", "sum"))
             .sort_values("quantity", ascending=False)
-            .head(5)
+            .head(10)
             .reset_index()
         )
         if not top_p.empty:
@@ -440,9 +519,7 @@ if all_products_raw:
             st.dataframe(
                 top_p,
                 width="stretch", hide_index=True,
-                column_config={
-                    "Выручка": st.column_config.NumberColumn(format="₽ %,.0f"),
-                },
+                column_config=top_col_config,
             )
         else:
             st.info("Нет данных за выбранный период")
@@ -453,7 +530,7 @@ if all_products_raw:
             prod_all.groupby(["name", "offer_id"])
             .agg(quantity=("quantity", "sum"), revenue=("price", "sum"))
             .sort_values("quantity", ascending=False)
-            .head(5)
+            .head(10)
             .reset_index()
         )
         if not top_all.empty:
@@ -461,9 +538,7 @@ if all_products_raw:
             st.dataframe(
                 top_all,
                 width="stretch", hide_index=True,
-                column_config={
-                    "Выручка": st.column_config.NumberColumn(format="₽ %,.0f"),
-                },
+                column_config=top_col_config,
             )
         else:
             st.info("Нет данных")

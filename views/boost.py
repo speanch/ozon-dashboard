@@ -8,7 +8,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from etl.models import init_db, get_session, BoostSnapshot, ProductPrice
-from etl.config import SHOP_LABELS
+from etl.config import SHOP_LABELS, order_shops
 from etl.shared_ui import render_refresh_button
 
 st.title("Бустинг 75%")
@@ -43,7 +43,7 @@ df = pd.DataFrame([{
 
 
 def _add_boost_status(d: pd.DataFrame) -> pd.DataFrame:
-    """Группа бустинга (по current_boost) и флаг «можно поднять мин. цену, сохранив 75%»."""
+    """Группа бустинга (по current_boost) и флаг «можно опустить цену до 75%»."""
     d = d.copy()
     cb = d["current_boost"].fillna(0).astype(float)
 
@@ -58,7 +58,8 @@ def _add_boost_status(d: pd.DataFrame) -> pd.DataFrame:
 
     pme = d["price_max_elastic"].fillna(0).astype(float)
     mp = d["min_price"].fillna(0).astype(float)
-    d["can_raise_min"] = (cb >= 75) & (mp > 0) & (mp < pme)
+    pr = d["price"].fillna(0).astype(float)
+    d["can_lower_to_75"] = (pr > 0) & (mp > 0) & (pme > 0) & (pr > pme) & (pme >= mp)
     return d
 
 
@@ -90,7 +91,7 @@ df["category"] = df["name"].map(_categorize)
 
 # ── фильтр по кабинету ───────────────────────────────────────────────────
 
-shops_avail = sorted(df["shop"].unique().tolist())
+shops_avail = order_shops(df["shop"].unique().tolist())
 selected_shop = st.selectbox(
     "Кабинет", shops_avail, format_func=lambda x: SHOP_LABELS.get(x, x),
 )
@@ -106,15 +107,21 @@ previous_date = dates[-2] if len(dates) >= 2 else None
 
 latest = shop_df[shop_df["snapshot_date"] == latest_date].copy()
 
-# ── минимальная цена (ниже неё опускать цену нельзя) ─────────────────────
+# ── цены из прайса (ваша цена / старая цена / минимальная) ──────────────
 
 min_by_product: dict = {}
 min_by_offer: dict = {}
+price_by_product: dict = {}
+price_by_offer: dict = {}
+old_by_product: dict = {}
+old_by_offer: dict = {}
 if prices_raw:
     prices_df = pd.DataFrame([{
         "shop": p.shop, "offer_id": p.offer_id or "",
         "product_id": p.product_id or "", "snapshot_date": p.snapshot_date,
         "min_price": p.min_price or 0,
+        "price": p.price or 0,
+        "old_price": p.old_price or 0,
     } for p in prices_raw])
     ps = prices_df[prices_df["shop"] == selected_shop]
     if not ps.empty:
@@ -122,14 +129,23 @@ if prices_raw:
         for _, r in ps.groupby("product_id", as_index=False).tail(1).iterrows():
             if r["product_id"]:
                 min_by_product[r["product_id"]] = r["min_price"]
+                price_by_product[r["product_id"]] = r["price"]
+                old_by_product[r["product_id"]] = r["old_price"]
         for _, r in ps.groupby("offer_id", as_index=False).tail(1).iterrows():
             if r["offer_id"]:
                 min_by_offer[r["offer_id"]] = r["min_price"]
+                price_by_offer[r["offer_id"]] = r["price"]
+                old_by_offer[r["offer_id"]] = r["old_price"]
 
 latest = latest.copy()
-latest["min_price"] = latest["product_id"].map(min_by_product)
-latest["min_price"] = latest["min_price"].fillna(
+latest["min_price"] = latest["product_id"].map(min_by_product).fillna(
     latest["offer_id"].map(min_by_offer)
+)
+latest["price"] = latest["product_id"].map(price_by_product).fillna(
+    latest["offer_id"].map(price_by_offer)
+)
+latest["old_price"] = latest["product_id"].map(old_by_product).fillna(
+    latest["offer_id"].map(old_by_offer)
 )
 
 latest = _add_boost_status(latest)
@@ -232,7 +248,7 @@ c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     status_filter = st.selectbox(
         "Статус бустинга",
-        ["Все", "Бустинг 75%+", "Бустинг 50-75%", "Бустинг ниже 50%", "Можно поднять мин. цену, сохранив 75%"],
+        ["Все", "Бустинг 75%+", "Бустинг 50-75%", "Бустинг ниже 50%", "Можно опустить цену до 75%"],
     )
 with c2:
     categories = sorted(latest["category"].unique().tolist())
@@ -247,8 +263,8 @@ elif status_filter == "Бустинг 50-75%":
     view = view[view["boost_group"] == "50-75%"]
 elif status_filter == "Бустинг ниже 50%":
     view = view[view["boost_group"] == "ниже 50%"]
-elif status_filter == "Можно поднять мин. цену, сохранив 75%":
-    view = view[view["can_raise_min"]]
+elif status_filter == "Можно опустить цену до 75%":
+    view = view[view["can_lower_to_75"]]
 
 if category_filter != "Все":
     view = view[view["category"] == category_filter]
@@ -263,13 +279,13 @@ if search:
 
 table = view[[
     "offer_id", "name", "category", "current_boost", "price_max_elastic",
-    "action_price", "price_min_elastic", "min_price", "boost_group", "can_raise_min",
+    "action_price", "price_min_elastic", "min_price", "boost_group", "can_lower_to_75",
 ]].copy()
 table.columns = [
     "Артикул", "Товар", "Категория", "Текущий бустинг %", "Цена для 75%",
-    "Текущая цена по акции", "Цена для 15%", "Мин. цена", "Статус", "Можно поднять мин. цену",
+    "Текущая цена по акции", "Цена для 15%", "Мин. цена", "Статус", "Можно опустить цену до 75%",
 ]
-table["Можно поднять мин. цену"] = table["Можно поднять мин. цену"].map({True: "Да", False: ""})
+table["Можно опустить цену до 75%"] = table["Можно опустить цену до 75%"].map({True: "Да", False: ""})
 table = table.sort_values("Артикул")
 
 common_config = {
@@ -297,8 +313,8 @@ st.dataframe(
     table, width="stretch", hide_index=True,
     column_config={
         **common_config,
-        "Можно поднять мин. цену": st.column_config.TextColumn(
-            help="«Да» — минимальную цену можно поднять (до цены для 75%), сохранив бустинг 75%.",
+        "Можно опустить цену до 75%": st.column_config.TextColumn(
+            help="«Да» — цену можно опустить до «цены для 75%», не опускаясь ниже минимальной.",
         ),
     },
 )
@@ -361,3 +377,136 @@ else:
             legend=dict(orientation="h"),
         )
         st.plotly_chart(fig, width="stretch")
+
+# ── автоустановка цены для 75% ───────────────────────────────────────────
+
+st.divider()
+st.subheader("Автоустановка цены для 75%")
+st.caption(
+    "«Ваша цена» опускается до «Цены для 75%» (price_max_elastic), чтобы товар "
+    "получил бустинг 75%. Ниже нашей минимальной цены (минимальной стоимости) "
+    "цена не опускается."
+)
+
+# товары, которым можно опустить цену до цены для 75% (не ниже минимальной стоимости)
+candidates = latest[
+    (latest["price_max_elastic"] > 0)
+    & (latest["price"] > 0)
+    & (latest["min_price"] > 0)
+    & (latest["price"] > latest["price_max_elastic"])
+    & (latest["price_max_elastic"] >= latest["min_price"])
+    & (latest["offer_id"] != "")
+].copy()
+
+# товары, у которых цена для 75% ниже минимальной стоимости — не трогаем
+blocked = latest[
+    (latest["price_max_elastic"] > 0)
+    & (latest["min_price"] > 0)
+    & (latest["price_max_elastic"] < latest["min_price"])
+    & (latest["offer_id"] != "")
+]
+
+if not blocked.empty:
+    st.warning(
+        f"Пропущено {len(blocked)} товаров: цена для 75% ниже минимальной стоимости, "
+        "опускать цену нельзя."
+    )
+
+if candidates.empty:
+    st.info("Нет товаров, у которых цену можно опустить до цены для 75%.")
+else:
+    preview = candidates[
+        ["offer_id", "name", "current_boost", "price", "price_max_elastic", "min_price"]
+    ].copy()
+    preview.columns = [
+        "Артикул", "Товар", "Текущий бустинг %",
+        "Текущая цена", "Новая цена (для 75%)", "Мин. цена",
+    ]
+    preview = preview.sort_values("Текущий бустинг %", ascending=False)
+
+    st.write(f"Будет опущена цена у товаров: **{len(preview)}**")
+    st.dataframe(
+        preview, width="stretch", hide_index=True,
+        column_config={
+            "Текущий бустинг %": st.column_config.NumberColumn(format="%.1f %%"),
+            "Текущая цена": st.column_config.NumberColumn(format="₽ %,.0f"),
+            "Новая цена (для 75%)": st.column_config.NumberColumn(format="₽ %,.0f"),
+            "Мин. цена": st.column_config.NumberColumn(format="₽ %,.0f"),
+        },
+    )
+
+    confirm = st.checkbox(
+        "Подтверждаю: цены этих товаров будут изменены в Ozon",
+        value=False,
+    )
+    if st.button(
+        "Опустить цену до 75%", type="primary", disabled=not confirm,
+    ):
+        from dotenv import load_dotenv; load_dotenv()
+        from etl.ozon_client import OzonClient
+
+        payload = []
+        for _, r in candidates.iterrows():
+            oid = r["offer_id"]
+            new_price = r["price_max_elastic"]
+            cur_old = r["old_price"] or 0
+            item = {
+                "offer_id": oid,
+                "price": str(int(new_price)),
+                "currency_code": "RUB",
+                "auto_action_enabled": "DISABLED",
+            }
+            if cur_old > new_price:
+                item["old_price"] = str(int(cur_old))
+            payload.append(item)
+
+        if not payload:
+            st.warning("Нет товаров для отправки.")
+        else:
+            try:
+                client = OzonClient(selected_shop)
+                client.update_prices(payload)
+                st.success(f"Отправлено на обновление: {len(payload)} товаров.")
+            except Exception as e:
+                st.error(f"Ошибка обновления цен: {e}")
+
+    st.divider()
+    st.markdown("**Тест на одном артикуле**")
+    st.caption("Отправляет изменение цены только для выбранного артикула.")
+
+    test_cand = candidates.drop_duplicates("offer_id").sort_values("offer_id")
+    test_names = dict(zip(test_cand["offer_id"].astype(str), test_cand["name"].astype(str)))
+
+    test_oid = st.selectbox(
+        "Артикул для теста",
+        sorted(test_names.keys()),
+        format_func=lambda o: f"{o} — {test_names.get(o, '')[:60]}",
+    )
+
+    if st.button("Тест: опустить цену у этого артикула", type="secondary"):
+        row = test_cand[test_cand["offer_id"].astype(str) == test_oid].iloc[0]
+        new_price = row["price_max_elastic"]
+        cur_min = row["min_price"]
+        cur_old = row["old_price"] or 0
+
+        item = {
+            "offer_id": test_oid,
+            "price": str(int(new_price)),
+            "currency_code": "RUB",
+            "auto_action_enabled": "DISABLED",
+        }
+        if cur_old > new_price:
+            item["old_price"] = str(int(cur_old))
+
+        st.info(
+            f"Отправляю: {test_oid} — новая цена {new_price:,.0f} ₽ "
+            f"(мин. цена {cur_min:,.0f} ₽)"
+        )
+        try:
+            from dotenv import load_dotenv; load_dotenv()
+            client = OzonClient(selected_shop)
+            resp = client.update_prices([item])
+            st.success("Запрос отправлен.")
+            st.json(resp)
+        except Exception as e:
+            st.error(f"Ошибка обновления цен: {e}")
